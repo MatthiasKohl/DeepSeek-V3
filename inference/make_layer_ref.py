@@ -571,13 +571,22 @@ def main(
     if rank == 0:
         out_name = "Ref671BTp8"
         # first save non-bs related tensors
-        numpy_dict = dict()
-        for key in output_state_dict:
-            if key.startswith("Bs"):
-                continue
-            v = output_state_dict[key]
-            numpy_dict[key] = v.to(device="cpu", dtype=torch.float32).numpy()
-        numpy.savez(f"{out_name}.npz", **numpy_dict)
+        if os.path.isfile(f"{out_name}.npz"):
+            print(f"Skipping saving non-batch dependent values to {out_name}.npz !")
+        else:
+            print(f"Saving non-batch dependent values to {out_name}.npz")
+            numpy_dict = dict()
+            for key in output_state_dict:
+                if key.startswith("Bs"):
+                    continue
+                v = output_state_dict[key]
+                if v is None:
+                    print(f"{key}: skipping optional value")
+                    continue
+                v_cpu = v.to(device="cpu", dtype=torch.float32)
+                print(f"{key}: type {v.dtype}, shape {v_cpu.shape}")
+                numpy_dict[key] = v_cpu.numpy()
+            numpy.savez(f"{out_name}.npz", **numpy_dict)
 
         for bs in [1, len(PROMPTS)]:
             print(f"Saving dict to file: {out_name}Bs{bs}.npz for rank {rank}")
