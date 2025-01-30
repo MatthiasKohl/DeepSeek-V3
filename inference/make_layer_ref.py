@@ -28,40 +28,40 @@ def print_seq(group: dist.ProcessGroup, *args, **kwargs):
 # most prompts from Google top100 (https://ahrefs.com/blog/top-google-questions/)
 PROMPTS = [
     "The color of the sky is blue but sometimes it can also be",
-    """\
-apple is pomme,
-bannana is banane,
-cherry is""",
-    "1, 2, 3, 5, 8, 13",
-    "ba ba black sheep, have you any wool?",
-    "what is my ip?",
-    "what to watch?",
-    "what dinosaur has 500 teeth?",
-    "who won the election 2024?",
-    "where is my train?",
-    "who won the election?",
-    "what the font?",
-    "how many weeks in a year?",
-    "how to vote lok sabha?",
-    "when is mother's day 2024?",
-    "que significa?",
-    "who called me?",
-    "where to watch india national cricket team vs england cricket team?",
-    "quando eh o prox carnaval?",
-    "cuando cobro?",
-    "how to screenshot on mac?",
-    "what is my ip address?",
-    "who is winning the election?",
-    "when is easter?",
-    "when the phone rings?",
-    "when is father's day 2024?",
-    "how to tie a tie?",
-    "what time is it?",
-    "where to watch australian men's cricket team vs india national cricket team?",
-    "how to screenshot on windows?",
-    "when is easter 2024?",
-    "how many days until christmas?",
-    "cuando juega boca?",
+#     """\
+# apple is pomme,
+# bannana is banane,
+# cherry is""",
+#     "1, 2, 3, 5, 8, 13",
+#     "ba ba black sheep, have you any wool?",
+#     "what is my ip?",
+#     "what to watch?",
+#     "what dinosaur has 500 teeth?",
+#     "who won the election 2024?",
+#     "where is my train?",
+#     "who won the election?",
+#     "what the font?",
+#     "how many weeks in a year?",
+#     "how to vote lok sabha?",
+#     "when is mother's day 2024?",
+#     "que significa?",
+#     "who called me?",
+#     "where to watch india national cricket team vs england cricket team?",
+#     "quando eh o prox carnaval?",
+#     "cuando cobro?",
+#     "how to screenshot on mac?",
+#     "what is my ip address?",
+#     "who is winning the election?",
+#     "when is easter?",
+#     "when the phone rings?",
+#     "when is father's day 2024?",
+#     "how to tie a tie?",
+#     "what time is it?",
+#     "where to watch australian men's cricket team vs india national cricket team?",
+#     "how to screenshot on windows?",
+#     "when is easter 2024?",
+#     "how many days until christmas?",
+#     "cuando juega boca?",
     # "how many ounces in a cup?",
     # "who is winning the election 2024?",
     # "how to delete instagram account?",
@@ -303,11 +303,15 @@ def _copy_mla(m: MLA, base_name: str, out: dict, inputs = None, group: dist.Proc
     _copy_linear(m.wo, base_name + "Proj", out, x=x.flatten(2), gather_out=False, group=group)
 
 def _copy_mlp(m: MLP, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
-    _copy_linear(m.w1, base_name + "Gate", out, group=group)
-    _copy_linear(m.w2, base_name + "Out", out, group=group)
-    _copy_linear(m.w3, base_name + "In", out, group=group)
-    if x is not None:
-        _copy_out(m, base_name, out, x, do_gather=False, group=group)
+    _copy_linear(m.w1, base_name + "Gate", out, x=x, group=group)
+    _copy_linear(m.w3, base_name + "In", out, x=x, group=group)
+    w1_out = out[base_name + "GateOutAct"][dist.get_rank(group=group)]
+    w3_out = out[base_name + "InOutAct"][dist.get_rank(group=group)]
+    fc2_in = F.silu(w1_out) * w3_out
+    _copy_linear(m.w2, base_name + "Out", out, x=fc2_in.detach(), gather_out=False, group=group)
+    # output is already copied in above linear, but for compatibility, we change the naming
+    out[base_name + "OutAct"] = out[base_name + "OutOutAct"]
+    del out[base_name + "OutOutAct"]
 
 def _copy_expert(m: Expert, ref_m: Expert, src: int, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
     rank = dist.get_rank(group=group)
@@ -536,10 +540,15 @@ def generate(
         # first save non-bs related tensors
         if os.path.isfile(f"{out_name}.npz"):
             print(f"Skipping saving non-batch dependent values to {out_name}.npz !")
+            # list() allows deleting keys on the fly
+            for key in list(output_state_dict):
+                if not key.startswith("Bs"):
+                    del output_state_dict[key]
         else:
             print(f"Saving non-batch dependent values to {out_name}.npz")
             numpy_dict = dict()
-            for key in output_state_dict:
+            # list() allows deleting keys on the fly
+            for key in list(output_state_dict):
                 if key.startswith("Bs"):
                     continue
                 v = output_state_dict[key]
@@ -549,6 +558,7 @@ def generate(
                 v_cpu = v.to(device="cpu", dtype=torch.float32)
                 print(f"{key}: type {v.dtype}, shape {v_cpu.shape}")
                 numpy_dict[key] = v_cpu.numpy()
+                del output_state_dict[key]
             numpy.savez(f"{out_name}.npz", **numpy_dict)
 
         bs = len(PROMPTS)
@@ -565,30 +575,24 @@ def generate(
 
                 for key_no_pref, key in exp_keys.items():
                     if "act" in key_no_pref.lower():
-                        ref_val = output_state_dict[f"{pref}FfnNormOutAct"]
-                        ref_val = ref_val.view(-1, ref_val.shape[-1])
-                        if key_no_pref != "OutAct":
-                            ref_val = ref_val[:, :output_state_dict[key].shape[-1]]
-                        indexes = output_state_dict[f"{pref}FfnGateOutActIdx"]
-                    else:
-                        ref_val = output_state_dict[key]
-                        indexes = None
+                        # we could zero-out activations, but it would cost
+                        # too much memory, so we keep activations per-expert
+                        continue
+                    ref_val = output_state_dict[key]
                     new_shape = (args.n_routed_experts,) + ref_val.shape
                     new_val = torch.zeros(*new_shape, dtype=ref_val.dtype, device=ref_val.device)
                     for e in range(args.n_routed_experts):
                         key_exp = f"{pref_exp}{e}{key_no_pref}"
                         if key_exp not in output_state_dict:
                             continue
-                        if indexes is None:
-                            new_val[e].copy_(output_state_dict[key_exp])
-                        else:
-                            idx, _ = torch.where(indexes == e)
-                            new_val[e].index_copy_(0, idx, output_state_dict[key_exp])
+                        new_val[e].copy_(output_state_dict[key_exp])
                         del output_state_dict[key_exp]
+                    output_state_dict[f"{pref_exp}{key_no_pref}"] = new_val
 
                 numpy_dict = dict()
                 torch.set_printoptions(precision=6, threshold=8, edgeitems=2, linewidth=120, sci_mode=False)
-                for key in output_state_dict:
+                # list() allows deleting keys on the fly
+                for key in list(output_state_dict):
                     if not key.startswith(pref):
                         continue
                     key_no_pref = key[len(pref):]
@@ -603,6 +607,7 @@ def generate(
                     v_cpu = v.to(device="cpu", dtype=out_dtype)
                     print(f"{key_no_pref}: type {v.dtype}, shape {v_cpu.shape}")
                     numpy_dict[key_no_pref] = v_cpu.numpy()
+                    del output_state_dict[key]
 
                 numpy.savez(f"{out_name}{pref}.npz", **numpy_dict)
 
