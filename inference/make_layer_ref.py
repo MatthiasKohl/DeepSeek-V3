@@ -10,6 +10,7 @@ import re
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from transformers import AutoTokenizer
 from safetensors.torch import load_model
 
@@ -27,40 +28,40 @@ def print_seq(group: dist.ProcessGroup, *args, **kwargs):
 # most prompts from Google top100 (https://ahrefs.com/blog/top-google-questions/)
 PROMPTS = [
     "The color of the sky is blue but sometimes it can also be",
-#     """\
-# apple is pomme,
-# bannana is banane,
-# cherry is""",
-#     "1, 2, 3, 5, 8, 13",
-#     "ba ba black sheep, have you any wool?",
-#     "what is my ip?",
-#     "what to watch?",
-#     "what dinosaur has 500 teeth?",
-#     "who won the election 2024?",
-#     "where is my train?",
-#     "who won the election?",
-#     "what the font?",
-#     "how many weeks in a year?",
-#     "how to vote lok sabha?",
-#     "when is mother's day 2024?",
-#     "que significa?",
-#     "who called me?",
-    # "where to watch india national cricket team vs england cricket team?",
-    # "quando eh o prox carnaval?",
-    # "cuando cobro?",
-    # "how to screenshot on mac?",
-    # "what is my ip address?",
-    # "who is winning the election?",
-    # "when is easter?",
-    # "when the phone rings?",
-    # "when is father's day 2024?",
-    # "how to tie a tie?",
-    # "what time is it?",
-    # "where to watch australian men's cricket team vs india national cricket team?",
-    # "how to screenshot on windows?",
-    # "when is easter 2024?",
-    # "how many days until christmas?",
-    # "cuando juega boca?",
+    """\
+apple is pomme,
+bannana is banane,
+cherry is""",
+    "1, 2, 3, 5, 8, 13",
+    "ba ba black sheep, have you any wool?",
+    "what is my ip?",
+    "what to watch?",
+    "what dinosaur has 500 teeth?",
+    "who won the election 2024?",
+    "where is my train?",
+    "who won the election?",
+    "what the font?",
+    "how many weeks in a year?",
+    "how to vote lok sabha?",
+    "when is mother's day 2024?",
+    "que significa?",
+    "who called me?",
+    "where to watch india national cricket team vs england cricket team?",
+    "quando eh o prox carnaval?",
+    "cuando cobro?",
+    "how to screenshot on mac?",
+    "what is my ip address?",
+    "who is winning the election?",
+    "when is easter?",
+    "when the phone rings?",
+    "when is father's day 2024?",
+    "how to tie a tie?",
+    "what time is it?",
+    "where to watch australian men's cricket team vs india national cricket team?",
+    "how to screenshot on windows?",
+    "when is easter 2024?",
+    "how many days until christmas?",
+    "cuando juega boca?",
     # "how many ounces in a cup?",
     # "who is winning the election 2024?",
     # "how to delete instagram account?",
@@ -158,7 +159,6 @@ PROMPTS = [
     # "how to backup iphone?",
     # "how old is dolly parton?",
 ]
-BS_RE = re.compile(r"^Bs([0-9]+).+$")
 
 def sample(logits, temperature: float = 1.0):
     """
@@ -197,17 +197,20 @@ def _gather(input_: torch.Tensor, dim: int = 0, group: dist.ProcessGroup = None)
 def _gather_scale(weight_: torch.Tensor, dim: int = 0, group: dist.ProcessGroup = None):
     if getattr(weight_, "scale", None) is None:
         return None
-    return _gather(weight_.scale.detach().clone(), dim=dim, group=group)
+    return _gather(weight_.scale.detach(), dim=dim, group=group)
 
-def _copy_out(m: torch.nn.Module, base_name: str, out: dict, x: torch.Tensor, is_gate: bool = False, group: dist.ProcessGroup = None):
-    h = m(x.detach().clone())
+def _copy_out(m: torch.nn.Module, base_name: str, out: dict, x: torch.Tensor, is_gate: bool = False, do_gather: bool = True, group: dist.ProcessGroup = None):
+    h = m(x.detach())
     if is_gate:
-        out[base_name + "OutActW"] = _gather(h[0].unsqueeze(0), group=group)
-        out[base_name + "OutActIdx"] = _gather(h[1].unsqueeze(0), group=group)
-    else:
+        # gate output is the same for all ranks
+        out[base_name + "OutActW"] = h[0]
+        out[base_name + "OutActIdx"] = h[1]
+    elif do_gather:
         out[base_name + "OutAct"] = _gather(h.unsqueeze(0), group=group)
+    else:
+        out[base_name + "OutAct"] = h
 
-def _copy_linear(m: Linear, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
+def _copy_linear(m: Linear, base_name: str, out: dict, x: torch.Tensor = None, gather_out: bool = True, group: dist.ProcessGroup = None):
     if isinstance(m, RowParallelLinear):
         gather_dim = 1
     else:
@@ -217,43 +220,47 @@ def _copy_linear(m: Linear, base_name: str, out: dict, x: torch.Tensor = None, g
     else:
         w = m.weight
     
-    out[base_name + "W"] = _gather(w.detach().clone(), dim=gather_dim, group=group)
+    out[base_name + "W"] = _gather(w.detach(), dim=gather_dim, group=group)
     out[base_name + "Wscale"] = _gather_scale(w, dim=gather_dim, group=group)
     if x is not None:
-        _copy_out(m, base_name, out, x, group=group)
+        _copy_out(m, base_name, out, x, do_gather=gather_out, group=group)
 
-def _copy_norm(m: RMSNorm, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
-    out[base_name + "W"] = _gather(m.weight.detach().clone().unsqueeze(0), group=group)
+def _copy_norm(m: RMSNorm, base_name: str, out: dict, x: torch.Tensor = None, do_gather: bool = False, group: dist.ProcessGroup = None):
+    # norm weights are the same for all ranks
+    if do_gather:
+        out[base_name + "W"] = _gather(m.weight.detach().unsqueeze(0), group=group)
+    else:
+        out[base_name + "W"] = m.weight.detach()
     if x is not None:
-        _copy_out(m, base_name, out, x, group=group)
+        _copy_out(m, base_name, out, x, do_gather=do_gather, group=group)
 
 def _copy_mla(m: MLA, base_name: str, out: dict, inputs = None, group: dist.ProcessGroup = None):
     # note: assume that q_lora_rank != 0 and attn_impl == "absorb"
     # always save the Kv cache first
-    out[base_name + "KvCache"] = _gather(m.kv_cache.detach().clone().unsqueeze(0), group=group)
-    out[base_name + "PeCache"] = _gather(m.pe_cache.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "KvCache"] = _gather(m.kv_cache.detach().unsqueeze(0), group=group)
+    out[base_name + "PeCache"] = _gather(m.pe_cache.detach().unsqueeze(0), group=group)
 
     if inputs is None:
         _copy_linear(m.wq_a, base_name + "Qa", out, group=group)
-        _copy_norm(m.q_norm, base_name + "NormQ", out, group=group)
+        _copy_norm(m.q_norm, base_name + "NormQ", out, do_gather=True, group=group)
         _copy_linear(m.wq_b, base_name + "Qb", out, group=group)
         _copy_linear(m.wkv_a, base_name + "KvA", out, group=group)
-        _copy_norm(m.kv_norm, base_name + "NormKv", out, group=group)
+        _copy_norm(m.kv_norm, base_name + "NormKv", out, do_gather=True, group=group)
         _copy_linear(m.wkv_b, base_name + "KvB", out, group=group)
         _copy_linear(m.wo, base_name + "Proj", out, group=group)
         return
 
     (x, start_pos, freqs_cis, mask) = inputs
-    freqs_cis = freqs_cis.detach().clone()
+    freqs_cis = freqs_cis.detach()
     if mask is not None:
-        mask = mask.detach().clone()
+        mask = mask.detach()
 
     bsz, seqlen, _ = x.size()
     end_pos = start_pos + seqlen
     # q = self.wq_b(self.q_norm(self.wq_a(x)))
     _copy_linear(m.wq_a, base_name + "Qa", out, x=x, group=group)
     wq_a_out = out[base_name + "QaOutAct"][dist.get_rank(group=group)]
-    _copy_norm(m.q_norm, base_name + "NormQ", out, x=wq_a_out, group=group)
+    _copy_norm(m.q_norm, base_name + "NormQ", out, x=wq_a_out, do_gather=True, group=group)
     q_norm_out = out[base_name + "NormQOutAct"][dist.get_rank(group=group)]
     _copy_linear(m.wq_b, base_name + "Qb", out, x=q_norm_out, group=group)
     q = out[base_name + "QbOutAct"][dist.get_rank(group=group)]
@@ -261,23 +268,23 @@ def _copy_mla(m: MLA, base_name: str, out: dict, inputs = None, group: dist.Proc
     q = q.view(bsz, seqlen, m.n_local_heads, m.qk_head_dim)
     q_nope, q_pe = torch.split(q, [m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
     q_pe = apply_rotary_emb(q_pe, freqs_cis)
-    out[base_name + "QNope"] = _gather(q_nope.detach().clone().unsqueeze(0), group=group)
-    out[base_name + "QPe"] = _gather(q_pe.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "QNope"] = _gather(q_nope.detach().unsqueeze(0), group=group)
+    out[base_name + "QPe"] = _gather(q_pe.detach().unsqueeze(0), group=group)
 
     # kv = self.wkv_a(x)
     _copy_linear(m.wkv_a, base_name + "KvA", out, x=x, group=group)
     kv = out[base_name + "KvAOutAct"][dist.get_rank(group=group)]
     kv, k_pe = torch.split(kv, [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-    out[base_name + "KPe"] = _gather(k_pe.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "KPe"] = _gather(k_pe.detach().unsqueeze(0), group=group)
 
     _copy_linear(m.wkv_b, base_name + "KvB", out, group=group)
     wkv_b = m.wkv_b.weight if m.wkv_b.scale is None else weight_dequant(m.wkv_b.weight, m.wkv_b.scale, block_size) 
     wkv_b = wkv_b.view(m.n_local_heads, -1, m.kv_lora_rank)
     q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :m.qk_nope_head_dim])
-    out[base_name + "Einsum1OutAct"] = _gather(q_nope.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "Einsum1OutAct"] = _gather(q_nope.detach().unsqueeze(0), group=group)
 
-    _copy_norm(m.kv_norm, base_name + "NormKv", out, x=kv, group=group)
+    _copy_norm(m.kv_norm, base_name + "NormKv", out, x=kv, do_gather=True, group=group)
     kv_norm_out = out[base_name + "NormKvOutAct"][dist.get_rank(group=group)]
     m.kv_cache[:bsz, start_pos:end_pos] = kv_norm_out
     m.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
@@ -285,22 +292,22 @@ def _copy_mla(m: MLA, base_name: str, out: dict, inputs = None, group: dist.Proc
                 torch.einsum("bshr,btr->bsht", q_pe, m.pe_cache[:bsz, :end_pos])) * m.softmax_scale
     if mask is not None:
         scores += mask.unsqueeze(1)
-    out[base_name + "ScoresPreSoftmax"] = _gather(scores.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "ScoresPreSoftmax"] = _gather(scores.detach().unsqueeze(0), group=group)
     scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-    out[base_name + "ScoresPostSoftmax"] = _gather(scores.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "ScoresPostSoftmax"] = _gather(scores.detach().unsqueeze(0), group=group)
 
     x = torch.einsum("bsht,btc->bshc", scores, m.kv_cache[:bsz, :end_pos])
-    out[base_name + "Einsum2OutAct"] = _gather(x.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "Einsum2OutAct"] = _gather(x.detach().unsqueeze(0), group=group)
     x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -m.v_head_dim:])
-    out[base_name + "Einsum3OutAct"] = _gather(x.detach().clone().unsqueeze(0), group=group)
-    _copy_linear(m.wo, base_name + "Proj", out, x=x.flatten(2), group=group)
+    out[base_name + "Einsum3OutAct"] = _gather(x.detach().unsqueeze(0), group=group)
+    _copy_linear(m.wo, base_name + "Proj", out, x=x.flatten(2), gather_out=False, group=group)
 
 def _copy_mlp(m: MLP, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
     _copy_linear(m.w1, base_name + "Gate", out, group=group)
     _copy_linear(m.w2, base_name + "Out", out, group=group)
     _copy_linear(m.w3, base_name + "In", out, group=group)
     if x is not None:
-        _copy_out(m, base_name, out, x, group=group)
+        _copy_out(m, base_name, out, x, do_gather=False, group=group)
 
 def _copy_expert(m: Expert, ref_m: Expert, src: int, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
     rank = dist.get_rank(group=group)
@@ -308,15 +315,15 @@ def _copy_expert(m: Expert, ref_m: Expert, src: int, base_name: str, out: dict, 
         if getattr(w.weight, "scale", None) is None:
             return None
         if rank == src:
-            return w.weight.scale.detach().clone()
+            return w.weight.scale.detach()
         return torch.empty_like(w.weight.scale)
 
     if rank == src:
-        w1_weight = m.w1.weight.detach().clone()
+        w1_weight = m.w1.weight.detach()
         w1_scale = get_scale(m.w1)
-        w2_weight = m.w2.weight.detach().clone()
+        w2_weight = m.w2.weight.detach()
         w2_scale = get_scale(m.w2)
-        w3_weight = m.w3.weight.detach().clone()
+        w3_weight = m.w3.weight.detach()
         w3_scale = get_scale(m.w3)
     else:
         w1_weight = torch.empty_like(ref_m.w1.weight)
@@ -344,15 +351,20 @@ def _copy_expert(m: Expert, ref_m: Expert, src: int, base_name: str, out: dict, 
 
     if x is not None:
         if rank == src:
-            h = m(x).detach().clone()
+            fc1Out = F.silu(m.w1(x)) * m.w3(x)
+            fc2Out = m.w2(fc1Out.detach())
         else:
-            h = torch.empty_like(x)
-        dist.broadcast(h, src, group=group)
-        out[base_name + "OutAct"] = h
+            fc1Out = torch.empty(x.size(0), ref_m.w1.out_features, dtype=x.dtype, device=x.device)
+            fc2Out = torch.empty_like(x)
+        dist.broadcast(fc1Out, src, group=group)
+        dist.broadcast(fc2Out, src, group=group)
+        out[base_name + "Fc1Act"] = fc1Out
+        out[base_name + "OutAct"] = fc2Out
 
 def _copy_gate(m: Gate, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
-    out[base_name + "W"] = _gather(m.weight.detach().clone().unsqueeze(0), group=group)
-    out[base_name + "B"] = _gather(m.bias.detach().clone().unsqueeze(0), group=group)
+    # Gate must be the same on all ranks
+    out[base_name + "W"] = m.weight.detach()
+    out[base_name + "B"] = m.bias.detach()
     if x is not None:
         _copy_out(m, base_name, out, x, is_gate=True, group=group)
 
@@ -370,8 +382,8 @@ def _copy_moe(m: MoE, base_name: str, out: dict, x: torch.Tensor = None, group: 
     shape = x.size()
     x = x.view(-1, m.dim)
     _copy_gate(m.gate, base_name + "Gate", out, x=x, group=group)
-    weights = out[base_name + "GateOutActW"][dist.get_rank(group=group)]
-    indices = out[base_name + "GateOutActIdx"][dist.get_rank(group=group)]
+    weights = out[base_name + "GateOutActW"]
+    indices = out[base_name + "GateOutActIdx"]
     y = torch.zeros_like(x)
     counts = torch.bincount(indices.flatten(), minlength=m.n_routed_experts)
     for i in range(m.n_routed_experts):
@@ -383,30 +395,31 @@ def _copy_moe(m: MoE, base_name: str, out: dict, x: torch.Tensor = None, group: 
             counts_src = torch.empty_like(counts)
             indices_src = torch.empty_like(indices)
         else:
-            counts_src = counts.detach().clone()
-            indices_src = indices.detach().clone()
+            counts_src = counts.detach()
+            indices_src = indices.detach()
         dist.broadcast(counts_src, src_rank, group=group)
         dist.broadcast(indices_src, src_rank, group=group)
-        if counts_src[i].item() == 0:
-            continue
         idx, top = torch.where(indices_src == i)
-        _copy_expert(m.experts[i], ref_exp, src_rank, base_name + f"Exp{i}", out, x=x[idx], group=group)
+        expert_in = None if counts_src[i].item() == 0 else x[idx]
+        _copy_expert(m.experts[i], ref_exp, src_rank, base_name + f"Exp{i}", out, x=expert_in, group=group)
+        if expert_in is None:
+            continue
         exp_out = out[base_name + f"Exp{i}OutAct"]
         if m.experts[i] is not None:
             # only the "real" rank performs the update on y, just like in ref
             y[idx] += exp_out * weights[idx, top, None]
 
-    out[base_name + "IntRouted"] = _gather(y.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "IntRouted"] = _gather(y.detach().unsqueeze(0), group=group)
 
     _copy_mlp(m.shared_experts, base_name + "ExpShared", out, x=x, group=group)
-    z = out[base_name + "ExpSharedOutAct"][dist.get_rank(group=group)]
+    z = out[base_name + "ExpSharedOutAct"]
     if dist.get_world_size(group=group) > 1:
         dist.all_reduce(y, group=group)
 
-    out[base_name + "Routed"] = y.detach().clone()
+    out[base_name + "Routed"] = y.detach()
 
     h = (y + z).view(shape)
-    out[base_name + "OutAct"] = _gather(h.detach().clone().unsqueeze(0), group=group)
+    out[base_name + "OutAct"] = h.detach()
 
 
 @torch.inference_mode()
@@ -436,7 +449,7 @@ def generate(
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if do_copy:
         output_state_dict[f"qkvRoPE"] = torch.view_as_real(model.freqs_cis.clone())
-        output_state_dict[f"embW"] = _gather(model.embed.weight.detach().clone())
+        output_state_dict[f"embW"] = _gather(model.embed.weight.detach())
         _copy_linear(model.head, "head", output_state_dict)
         layer_id_dense = args.n_dense_layers - 1
         layer_id_normal = args.n_dense_layers + 2
@@ -454,28 +467,28 @@ def generate(
         pref = f"Bs{tokens.size(0)}Lid{layer_id}Pos{start_pos}"
 
         next_module = model.layers[layer_id + 1]
-        output_state_dict[f"{pref}ActIn"] = tokens.detach().clone()
+        output_state_dict[f"{pref}ActIn"] = tokens.detach()
         _copy_norm(module.attn_norm, f"{pref}AttnNorm", output_state_dict, x=tokens)
 
         output_state_dict[f"{pref}Mask"] = mask
-        norm_out = output_state_dict[f"{pref}AttnNormOutAct"][dist.get_rank()]
+        norm_out = output_state_dict[f"{pref}AttnNormOutAct"]
         _copy_mla(module.attn, f"{pref}Attn", output_state_dict, inputs=(norm_out, start_pos, freqs_cis, mask))
 
-        attn_out = output_state_dict[f"{pref}AttnProjOutAct"][dist.get_rank()]
+        attn_out = output_state_dict[f"{pref}AttnProjOutAct"]
         act_int = output_state_dict[f"{pref}ActIn"] + attn_out
-        output_state_dict[f"{pref}ActInt"] = _gather(act_int.unsqueeze(0))
+        output_state_dict[f"{pref}ActInt"] = act_int
 
-        _copy_norm(module.ffn_norm, f"{pref}FfnNorm", output_state_dict, x=output_state_dict[f"{pref}ActInt"][dist.get_rank()])
+        _copy_norm(module.ffn_norm, f"{pref}FfnNorm", output_state_dict, x=act_int)
 
-        norm_ffn_out = output_state_dict[f"{pref}FfnNormOutAct"][dist.get_rank()]
+        norm_ffn_out = output_state_dict[f"{pref}FfnNormOutAct"]
         if layer_id == layer_id_dense:
             _copy_mlp(module.ffn, f"{pref}Ffn", output_state_dict, x=norm_ffn_out)
         else:
             _copy_moe(module.ffn, f"{pref}Ffn", output_state_dict, x=norm_ffn_out)
 
-        ffn_out = output_state_dict[f"{pref}FfnOutAct"][dist.get_rank()]
-        output_state_dict[f"{pref}ActOut"] = _gather((act_int + ffn_out).unsqueeze(0))
-        _copy_norm(next_module.attn_norm, f"{pref}AttnNormNext", output_state_dict, x=act_int + ffn_out)
+        ffn_out = output_state_dict[f"{pref}FfnOutAct"]
+        output_state_dict[f"{pref}ActOut"] = act_int + ffn_out
+        _copy_norm(next_module.attn_norm, f"{pref}AttnNormNext", output_state_dict, x=output_state_dict[f"{pref}ActOut"])
         print_seq(None, f"{dist.get_rank()}: copied values for batch {tokens.size(0)}, layer {layer_id}, pos {start_pos}")
 
     prompt_lens = [len(t) for t in prompt_tokens]
@@ -515,6 +528,85 @@ def generate(
         if eos_id in toks:
             toks = toks[:toks.index(eos_id)]
         completion_tokens.append(toks)
+
+    # save the output
+    rank = dist.get_rank()
+    if rank == 0 and do_copy:
+        out_name = "Ref671BTp8"
+        # first save non-bs related tensors
+        if os.path.isfile(f"{out_name}.npz"):
+            print(f"Skipping saving non-batch dependent values to {out_name}.npz !")
+        else:
+            print(f"Saving non-batch dependent values to {out_name}.npz")
+            numpy_dict = dict()
+            for key in output_state_dict:
+                if key.startswith("Bs"):
+                    continue
+                v = output_state_dict[key]
+                if v is None:
+                    print(f"{key}: skipping optional value")
+                    continue
+                v_cpu = v.to(device="cpu", dtype=torch.float32)
+                print(f"{key}: type {v.dtype}, shape {v_cpu.shape}")
+                numpy_dict[key] = v_cpu.numpy()
+            numpy.savez(f"{out_name}.npz", **numpy_dict)
+
+        bs = len(PROMPTS)
+        for lid in (layer_id_normal, layer_id_dense):
+            for pos in (pos_id_context, pos_id_gen):
+                pref = f"Bs{bs}Lid{lid}Pos{pos}"
+                print(f"Saving dict to file: {out_name}{pref}.npz for rank {rank}")
+                # re-write individual expert arrays to large batched array
+                pref_exp = f"{pref}FfnExp"
+                re_exp = re.compile(r"^" + re.escape(pref_exp) + r"[0-9]+([a-zA-Z]+[0-9]?[a-zA-Z]+)$")
+                exp_keys_re = ((re_exp.fullmatch(k), k) for k in output_state_dict)
+                exp_keys_m = (x for x in exp_keys_re if x[0] is not None)
+                exp_keys = {m.group(1): k for m, k in exp_keys_m}
+
+                for key_no_pref, key in exp_keys.items():
+                    if "act" in key_no_pref.lower():
+                        ref_val = output_state_dict[f"{pref}FfnNormOutAct"]
+                        ref_val = ref_val.view(-1, ref_val.shape[-1])
+                        if key_no_pref != "OutAct":
+                            ref_val = ref_val[:, :output_state_dict[key].shape[-1]]
+                        indexes = output_state_dict[f"{pref}FfnGateOutActIdx"]
+                    else:
+                        ref_val = output_state_dict[key]
+                        indexes = None
+                    new_shape = (args.n_routed_experts,) + ref_val.shape
+                    new_val = torch.zeros(*new_shape, dtype=ref_val.dtype, device=ref_val.device)
+                    for e in range(args.n_routed_experts):
+                        key_exp = f"{pref_exp}{e}{key_no_pref}"
+                        if key_exp not in output_state_dict:
+                            continue
+                        if indexes is None:
+                            new_val[e].copy_(output_state_dict[key_exp])
+                        else:
+                            idx, _ = torch.where(indexes == e)
+                            new_val[e].index_copy_(0, idx, output_state_dict[key_exp])
+                        del output_state_dict[key_exp]
+
+                numpy_dict = dict()
+                torch.set_printoptions(precision=6, threshold=8, edgeitems=2, linewidth=120, sci_mode=False)
+                for key in output_state_dict:
+                    if not key.startswith(pref):
+                        continue
+                    key_no_pref = key[len(pref):]
+                    v = output_state_dict[key]
+                    if v is None:
+                        print(f"{key_no_pref}: skipping optional value")
+                        continue
+                    if v.dtype.is_floating_point:
+                        out_dtype = torch.float32
+                    else:
+                        out_dtype = v.dtype
+                    v_cpu = v.to(device="cpu", dtype=out_dtype)
+                    print(f"{key_no_pref}: type {v.dtype}, shape {v_cpu.shape}")
+                    numpy_dict[key_no_pref] = v_cpu.numpy()
+
+                numpy.savez(f"{out_name}{pref}.npz", **numpy_dict)
+
+
     return completion_tokens
 
 
@@ -566,49 +658,6 @@ def main(
         print0("Prompt:", prompt)
         print0("Completion:", completion)
         print0()
-
-    # save the output
-    if rank == 0:
-        out_name = "Ref671BTp8"
-        # first save non-bs related tensors
-        if os.path.isfile(f"{out_name}.npz"):
-            print(f"Skipping saving non-batch dependent values to {out_name}.npz !")
-        else:
-            print(f"Saving non-batch dependent values to {out_name}.npz")
-            numpy_dict = dict()
-            for key in output_state_dict:
-                if key.startswith("Bs"):
-                    continue
-                v = output_state_dict[key]
-                if v is None:
-                    print(f"{key}: skipping optional value")
-                    continue
-                v_cpu = v.to(device="cpu", dtype=torch.float32)
-                print(f"{key}: type {v.dtype}, shape {v_cpu.shape}")
-                numpy_dict[key] = v_cpu.numpy()
-            numpy.savez(f"{out_name}.npz", **numpy_dict)
-
-        for bs in [1, len(PROMPTS)]:
-            print(f"Saving dict to file: {out_name}Bs{bs}.npz for rank {rank}")
-            numpy_dict = dict()
-            torch.set_printoptions(precision=6, threshold=8, edgeitems=2, linewidth=120, sci_mode=False)
-            for key in output_state_dict:
-                m = BS_RE.fullmatch(key)
-                if m is None or int(m.group(1)) != bs:
-                    continue
-                v = output_state_dict[key]
-                if v is None:
-                    print(f"{key}: skipping optional value")
-                    continue
-                if v.dtype.is_floating_point:
-                    out_dtype = torch.float32
-                else:
-                    out_dtype = v.dtype
-                v_cpu = v.to(device="cpu", dtype=out_dtype)
-                print(f"{key}: type {v.dtype}, shape {v_cpu.shape}")
-                numpy_dict[key] = v_cpu.numpy()
-
-            numpy.savez(f"{out_name}Bs{bs}.npz", **numpy_dict)
 
     if world_size > 1:
         dist.destroy_process_group()
