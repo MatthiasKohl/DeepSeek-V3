@@ -199,18 +199,19 @@ def _gather_scale(weight_: torch.Tensor, dim: int = 0, group: dist.ProcessGroup 
         return None
     return _gather(weight_.scale.detach(), dim=dim, group=group)
 
-def _copy_out(m: torch.nn.Module, base_name: str, out: dict, x: torch.Tensor, is_gate: bool = False, do_gather: bool = True, group: dist.ProcessGroup = None):
+def _copy_out(m: torch.nn.Module, base_name: str, out: dict, x: torch.Tensor, act_inputs: tuple, is_gate: bool = False, group: dist.ProcessGroup = None):
+    pref_x, do_gather = act_inputs
     h = m(x.detach())
     if is_gate:
         # gate output is the same for all ranks
-        out[base_name + "OutActW"] = h[0]
-        out[base_name + "OutActIdx"] = h[1]
+        out[pref_x + base_name + "OutActW"] = h[0]
+        out[pref_x + base_name + "OutActIdx"] = h[1]
     elif do_gather:
-        out[base_name + "OutAct"] = _gather(h.unsqueeze(0), group=group)
+        out[pref_x + base_name + "OutAct"] = _gather(h.unsqueeze(0), group=group)
     else:
-        out[base_name + "OutAct"] = h
+        out[pref_x + base_name + "OutAct"] = h
 
-def _copy_linear(m: Linear, base_name: str, out: dict, x: torch.Tensor = None, gather_out: bool = True, group: dist.ProcessGroup = None):
+def _copy_linear(m: Linear, base_name: str, out: dict, x: torch.Tensor = None, act_inputs: tuple = None, group: dist.ProcessGroup = None):
     if isinstance(m, RowParallelLinear):
         gather_dim = 1
     else:
@@ -219,20 +220,20 @@ def _copy_linear(m: Linear, base_name: str, out: dict, x: torch.Tensor = None, g
         w = m.weight.unsqueeze(0)
     else:
         w = m.weight
-    
+
     out[base_name + "W"] = _gather(w.detach(), dim=gather_dim, group=group)
     out[base_name + "Wscale"] = _gather_scale(w, dim=gather_dim, group=group)
     if x is not None:
-        _copy_out(m, base_name, out, x, do_gather=gather_out, group=group)
+        _copy_out(m, base_name, out, x, act_inputs, group=group)
 
-def _copy_norm(m: RMSNorm, base_name: str, out: dict, x: torch.Tensor = None, do_gather: bool = False, group: dist.ProcessGroup = None):
+def _copy_norm(m: RMSNorm, base_name: str, out: dict, x: torch.Tensor = None, do_gather: bool = False, pref_x: str = "", group: dist.ProcessGroup = None):
     # norm weights are the same for all ranks
     if do_gather:
         out[base_name + "W"] = _gather(m.weight.detach().unsqueeze(0), group=group)
     else:
         out[base_name + "W"] = m.weight.detach()
     if x is not None:
-        _copy_out(m, base_name, out, x, do_gather=do_gather, group=group)
+        _copy_out(m, base_name, out, x, (pref_x, do_gather), group=group)
 
 def _copy_mla(m: MLA, base_name: str, out: dict, inputs = None, group: dist.ProcessGroup = None):
     # note: assume that q_lora_rank != 0 and attn_impl == "absorb"
@@ -250,7 +251,7 @@ def _copy_mla(m: MLA, base_name: str, out: dict, inputs = None, group: dist.Proc
         _copy_linear(m.wo, base_name + "Proj", out, group=group)
         return
 
-    (x, start_pos, freqs_cis, mask) = inputs
+    x, start_pos, freqs_cis, mask, pref_x = inputs
     freqs_cis = freqs_cis.detach()
     if mask is not None:
         mask = mask.detach()
@@ -258,62 +259,62 @@ def _copy_mla(m: MLA, base_name: str, out: dict, inputs = None, group: dist.Proc
     bsz, seqlen, _ = x.size()
     end_pos = start_pos + seqlen
     # q = self.wq_b(self.q_norm(self.wq_a(x)))
-    _copy_linear(m.wq_a, base_name + "Qa", out, x=x, group=group)
-    wq_a_out = out[base_name + "QaOutAct"][dist.get_rank(group=group)]
-    _copy_norm(m.q_norm, base_name + "NormQ", out, x=wq_a_out, do_gather=True, group=group)
-    q_norm_out = out[base_name + "NormQOutAct"][dist.get_rank(group=group)]
-    _copy_linear(m.wq_b, base_name + "Qb", out, x=q_norm_out, group=group)
-    q = out[base_name + "QbOutAct"][dist.get_rank(group=group)]
+    _copy_linear(m.wq_a, base_name + "Qa", out, x=x, act_inputs=(pref_x, True), group=group)
+    wq_a_out = out[pref_x + base_name + "QaOutAct"][dist.get_rank(group=group)]
+    _copy_norm(m.q_norm, base_name + "NormQ", out, x=wq_a_out, do_gather=True, pref_x=pref_x, group=group)
+    q_norm_out = out[pref_x + base_name + "NormQOutAct"][dist.get_rank(group=group)]
+    _copy_linear(m.wq_b, base_name + "Qb", out, x=q_norm_out, act_inputs=(pref_x, True), group=group)
+    q = out[pref_x + base_name + "QbOutAct"][dist.get_rank(group=group)]
 
     q = q.view(bsz, seqlen, m.n_local_heads, m.qk_head_dim)
     q_nope, q_pe = torch.split(q, [m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
     q_pe = apply_rotary_emb(q_pe, freqs_cis)
-    out[base_name + "QNope"] = _gather(q_nope.detach().unsqueeze(0), group=group)
-    out[base_name + "QPe"] = _gather(q_pe.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "QNope"] = _gather(q_nope.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "QPe"] = _gather(q_pe.detach().unsqueeze(0), group=group)
 
     # kv = self.wkv_a(x)
-    _copy_linear(m.wkv_a, base_name + "KvA", out, x=x, group=group)
-    kv = out[base_name + "KvAOutAct"][dist.get_rank(group=group)]
+    _copy_linear(m.wkv_a, base_name + "KvA", out, x=x, act_inputs=(pref_x, True), group=group)
+    kv = out[pref_x + base_name + "KvAOutAct"][dist.get_rank(group=group)]
     kv, k_pe = torch.split(kv, [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-    out[base_name + "KPe"] = _gather(k_pe.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "KPe"] = _gather(k_pe.detach().unsqueeze(0), group=group)
 
     _copy_linear(m.wkv_b, base_name + "KvB", out, group=group)
     wkv_b = m.wkv_b.weight if m.wkv_b.scale is None else weight_dequant(m.wkv_b.weight, m.wkv_b.scale, block_size) 
     wkv_b = wkv_b.view(m.n_local_heads, -1, m.kv_lora_rank)
     q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :m.qk_nope_head_dim])
-    out[base_name + "Einsum1OutAct"] = _gather(q_nope.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "Einsum1OutAct"] = _gather(q_nope.detach().unsqueeze(0), group=group)
 
-    _copy_norm(m.kv_norm, base_name + "NormKv", out, x=kv, do_gather=True, group=group)
-    kv_norm_out = out[base_name + "NormKvOutAct"][dist.get_rank(group=group)]
+    _copy_norm(m.kv_norm, base_name + "NormKv", out, x=kv, do_gather=True, pref_x=pref_x, group=group)
+    kv_norm_out = out[pref_x + base_name + "NormKvOutAct"][dist.get_rank(group=group)]
     m.kv_cache[:bsz, start_pos:end_pos] = kv_norm_out
     m.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
     scores = (torch.einsum("bshc,btc->bsht", q_nope, m.kv_cache[:bsz, :end_pos]) +
                 torch.einsum("bshr,btr->bsht", q_pe, m.pe_cache[:bsz, :end_pos])) * m.softmax_scale
     if mask is not None:
         scores += mask.unsqueeze(1)
-    out[base_name + "ScoresPreSoftmax"] = _gather(scores.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "ScoresPreSoftmax"] = _gather(scores.detach().unsqueeze(0), group=group)
     scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-    out[base_name + "ScoresPostSoftmax"] = _gather(scores.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "ScoresPostSoftmax"] = _gather(scores.detach().unsqueeze(0), group=group)
 
     x = torch.einsum("bsht,btc->bshc", scores, m.kv_cache[:bsz, :end_pos])
-    out[base_name + "Einsum2OutAct"] = _gather(x.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "Einsum2OutAct"] = _gather(x.detach().unsqueeze(0), group=group)
     x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -m.v_head_dim:])
-    out[base_name + "Einsum3OutAct"] = _gather(x.detach().unsqueeze(0), group=group)
-    _copy_linear(m.wo, base_name + "Proj", out, x=x.flatten(2), gather_out=False, group=group)
+    out[pref_x + base_name + "Einsum3OutAct"] = _gather(x.detach().unsqueeze(0), group=group)
+    _copy_linear(m.wo, base_name + "Proj", out, x=x.flatten(2), act_inputs=(pref_x, False), group=group)
 
-def _copy_mlp(m: MLP, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
-    _copy_linear(m.w1, base_name + "Gate", out, x=x, group=group)
-    _copy_linear(m.w3, base_name + "In", out, x=x, group=group)
-    w1_out = out[base_name + "GateOutAct"][dist.get_rank(group=group)]
-    w3_out = out[base_name + "InOutAct"][dist.get_rank(group=group)]
+def _copy_mlp(m: MLP, base_name: str, out: dict, x: torch.Tensor = None, pref_x: str = "", group: dist.ProcessGroup = None):
+    _copy_linear(m.w1, base_name + "Gate", out, x=x, act_inputs=(pref_x, True), group=group)
+    _copy_linear(m.w3, base_name + "In", out, x=x, act_inputs=(pref_x, True), group=group)
+    w1_out = out[pref_x + base_name + "GateOutAct"][dist.get_rank(group=group)]
+    w3_out = out[pref_x + base_name + "InOutAct"][dist.get_rank(group=group)]
     fc2_in = F.silu(w1_out) * w3_out
-    _copy_linear(m.w2, base_name + "Out", out, x=fc2_in.detach(), gather_out=False, group=group)
+    _copy_linear(m.w2, base_name + "Out", out, x=fc2_in.detach(), act_inputs=(pref_x, False), group=group)
     # output is already copied in above linear, but for compatibility, we change the naming
-    out[base_name + "OutAct"] = out[base_name + "OutOutAct"]
-    del out[base_name + "OutOutAct"]
+    out[pref_x + base_name + "OutAct"] = out[pref_x + base_name + "OutOutAct"]
+    del out[pref_x + base_name + "OutOutAct"]
 
-def _copy_expert(m: Expert, ref_m: Expert, src: int, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
+def _copy_expert(m: Expert, ref_m: Expert, src: int, base_name: str, out: dict, x: torch.Tensor = None, pref_x: str = "", group: dist.ProcessGroup = None):
     rank = dist.get_rank(group=group)
     def get_scale(w: Linear):
         if getattr(w.weight, "scale", None) is None:
@@ -362,17 +363,17 @@ def _copy_expert(m: Expert, ref_m: Expert, src: int, base_name: str, out: dict, 
             fc2Out = torch.empty_like(x)
         dist.broadcast(fc1Out, src, group=group)
         dist.broadcast(fc2Out, src, group=group)
-        out[base_name + "Fc1Act"] = fc1Out
-        out[base_name + "OutAct"] = fc2Out
+        out[pref_x + base_name + "Fc1Act"] = fc1Out
+        out[pref_x + base_name + "OutAct"] = fc2Out
 
-def _copy_gate(m: Gate, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
+def _copy_gate(m: Gate, base_name: str, out: dict, x: torch.Tensor = None, pref_x: str = "", group: dist.ProcessGroup = None):
     # Gate must be the same on all ranks
     out[base_name + "W"] = m.weight.detach()
     out[base_name + "B"] = m.bias.detach()
     if x is not None:
-        _copy_out(m, base_name, out, x, is_gate=True, group=group)
+        _copy_out(m, base_name, out, x, (pref_x, False), is_gate=True, group=group)
 
-def _copy_moe(m: MoE, base_name: str, out: dict, x: torch.Tensor = None, group: dist.ProcessGroup = None):
+def _copy_moe(m: MoE, base_name: str, out: dict, x: torch.Tensor = None, pref_x: str = "", group: dist.ProcessGroup = None):
     ref_exp = m.experts[m.experts_start_idx]
     if x is None:
         _copy_gate(m.gate, base_name + "Gate", out, group=group)
@@ -385,9 +386,9 @@ def _copy_moe(m: MoE, base_name: str, out: dict, x: torch.Tensor = None, group: 
 
     shape = x.size()
     x = x.view(-1, m.dim)
-    _copy_gate(m.gate, base_name + "Gate", out, x=x, group=group)
-    weights = out[base_name + "GateOutActW"]
-    indices = out[base_name + "GateOutActIdx"]
+    _copy_gate(m.gate, base_name + "Gate", out, x=x, pref_x=pref_x, group=group)
+    weights = out[pref_x + base_name + "GateOutActW"]
+    indices = out[pref_x + base_name + "GateOutActIdx"]
     y = torch.zeros_like(x)
     counts = torch.bincount(indices.flatten(), minlength=m.n_routed_experts)
     for i in range(m.n_routed_experts):
@@ -405,25 +406,25 @@ def _copy_moe(m: MoE, base_name: str, out: dict, x: torch.Tensor = None, group: 
         dist.broadcast(indices_src, src_rank, group=group)
         idx, top = torch.where(indices_src == i)
         expert_in = None if counts_src[i].item() == 0 else x[idx]
-        _copy_expert(m.experts[i], ref_exp, src_rank, base_name + f"Exp{i}", out, x=expert_in, group=group)
+        _copy_expert(m.experts[i], ref_exp, src_rank, base_name + f"Exp{i}", out, x=expert_in, pref_x=pref_x, group=group)
         if expert_in is None:
             continue
-        exp_out = out[base_name + f"Exp{i}OutAct"]
+        exp_out = out[pref_x + base_name + f"Exp{i}OutAct"]
         if m.experts[i] is not None:
             # only the "real" rank performs the update on y, just like in ref
             y[idx] += exp_out * weights[idx, top, None]
 
-    out[base_name + "IntRouted"] = _gather(y.detach().unsqueeze(0), group=group)
+    out[pref_x + base_name + "IntRouted"] = _gather(y.detach().unsqueeze(0), group=group)
 
-    _copy_mlp(m.shared_experts, base_name + "ExpShared", out, x=x, group=group)
-    z = out[base_name + "ExpSharedOutAct"]
+    _copy_mlp(m.shared_experts, base_name + "ExpShared", out, x=x, pref_x=pref_x, group=group)
+    z = out[pref_x + base_name + "ExpSharedOutAct"]
     if dist.get_world_size(group=group) > 1:
         dist.all_reduce(y, group=group)
 
-    out[base_name + "Routed"] = y.detach()
+    out[pref_x + base_name + "Routed"] = y.detach()
 
     h = (y + z).view(shape)
-    out[base_name + "OutAct"] = h.detach()
+    out[pref_x + base_name + "OutAct"] = h.detach()
 
 
 @torch.inference_mode()
@@ -468,31 +469,33 @@ def generate(
     def copy_values(layer_id, module, inputs, _):
         tokens, start_pos, freqs_cis, mask = inputs
         next_module = model.layers[layer_id + 1]
-        pref = f"Bs{tokens.size(0)}Lid{layer_id}Pos{start_pos}"
+        pref = f"Lid{layer_id}"
+        pref_x = f"Bs{tokens.size(0)}Pos{start_pos}"
+        pref_act = f"{pref_x}{pref}"
 
         next_module = model.layers[layer_id + 1]
-        output_state_dict[f"{pref}ActIn"] = tokens.detach()
-        _copy_norm(module.attn_norm, f"{pref}AttnNorm", output_state_dict, x=tokens)
+        output_state_dict[f"{pref_act}ActIn"] = tokens.detach()
+        _copy_norm(module.attn_norm, f"{pref}AttnNorm", output_state_dict, x=tokens, pref_x=pref_x)
 
-        output_state_dict[f"{pref}Mask"] = mask
-        norm_out = output_state_dict[f"{pref}AttnNormOutAct"]
-        _copy_mla(module.attn, f"{pref}Attn", output_state_dict, inputs=(norm_out, start_pos, freqs_cis, mask))
+        output_state_dict[f"{pref_act}Mask"] = mask
+        norm_out = output_state_dict[f"{pref_act}AttnNormOutAct"]
+        _copy_mla(module.attn, f"{pref}Attn", output_state_dict, inputs=(norm_out, start_pos, freqs_cis, mask, pref_x))
 
-        attn_out = output_state_dict[f"{pref}AttnProjOutAct"]
-        act_int = output_state_dict[f"{pref}ActIn"] + attn_out
-        output_state_dict[f"{pref}ActInt"] = act_int
+        attn_out = output_state_dict[f"{pref_act}AttnProjOutAct"]
+        act_int = output_state_dict[f"{pref_act}ActIn"] + attn_out
+        output_state_dict[f"{pref_act}ActInt"] = act_int
 
-        _copy_norm(module.ffn_norm, f"{pref}FfnNorm", output_state_dict, x=act_int)
+        _copy_norm(module.ffn_norm, f"{pref}FfnNorm", output_state_dict, x=act_int, pref_x=pref_x)
 
-        norm_ffn_out = output_state_dict[f"{pref}FfnNormOutAct"]
+        norm_ffn_out = output_state_dict[f"{pref_act}FfnNormOutAct"]
         if layer_id == layer_id_dense:
-            _copy_mlp(module.ffn, f"{pref}Ffn", output_state_dict, x=norm_ffn_out)
+            _copy_mlp(module.ffn, f"{pref}Ffn", output_state_dict, x=norm_ffn_out, pref_x=pref_x)
         else:
-            _copy_moe(module.ffn, f"{pref}Ffn", output_state_dict, x=norm_ffn_out)
+            _copy_moe(module.ffn, f"{pref}Ffn", output_state_dict, x=norm_ffn_out, pref_x=pref_x)
 
-        ffn_out = output_state_dict[f"{pref}FfnOutAct"]
-        output_state_dict[f"{pref}ActOut"] = act_int + ffn_out
-        _copy_norm(next_module.attn_norm, f"{pref}AttnNormNext", output_state_dict, x=output_state_dict[f"{pref}ActOut"])
+        ffn_out = output_state_dict[f"{pref_act}FfnOutAct"]
+        output_state_dict[f"{pref_act}ActOut"] = act_int + ffn_out
+        _copy_norm(next_module.attn_norm, f"{pref}AttnNormNext", output_state_dict, x=output_state_dict[f"{pref_act}ActOut"], pref_x=pref_x)
         print_seq(None, f"{dist.get_rank()}: copied values for batch {tokens.size(0)}, layer {layer_id}, pos {start_pos}")
 
     prompt_lens = [len(t) for t in prompt_tokens]
@@ -536,81 +539,110 @@ def generate(
     # save the output
     rank = dist.get_rank()
     if rank == 0 and do_copy:
+        torch.set_printoptions(precision=6, threshold=8, edgeitems=2, linewidth=120, sci_mode=False)
+
+        def store(numpy_dict, key, key_no_pref=None):
+            if key_no_pref is None:
+                key_no_pref = key
+            v = output_state_dict[key]
+            if v is None:
+                print(f"{key_no_pref}: skipping optional value")
+                return
+            if v.dtype.is_floating_point:
+                out_dtype = torch.float32
+            else:
+                out_dtype = v.dtype
+            v_cpu = v.to(device="cpu", dtype=out_dtype)
+            print(f"{key_no_pref}: type {v.dtype}, shape {v_cpu.shape}")
+            numpy_dict[key_no_pref] = v_cpu.numpy()
+
         out_name = "Ref671BTp8"
         # first save non-bs related tensors
+        print()
         if os.path.isfile(f"{out_name}.npz"):
-            print(f"Skipping saving non-batch dependent values to {out_name}.npz !")
+            print(f"Skipping saving non-batch/layer dependent values to {out_name}.npz !")
             # list() allows deleting keys on the fly
             for key in list(output_state_dict):
-                if not key.startswith("Bs"):
+                if not key.startswith("Bs") and not key.startswith("Lid"):
                     del output_state_dict[key]
         else:
-            print(f"Saving non-batch dependent values to {out_name}.npz")
+            print(f"Saving non-batch/layer dependent values to {out_name}.npz")
             numpy_dict = dict()
             # list() allows deleting keys on the fly
             for key in list(output_state_dict):
-                if key.startswith("Bs"):
+                if key.startswith("Bs") or key.startswith("Lid"):
                     continue
-                v = output_state_dict[key]
-                if v is None:
-                    print(f"{key}: skipping optional value")
-                    continue
-                v_cpu = v.to(device="cpu", dtype=torch.float32)
-                print(f"{key}: type {v.dtype}, shape {v_cpu.shape}")
-                numpy_dict[key] = v_cpu.numpy()
+                store(numpy_dict, key)
                 del output_state_dict[key]
             numpy.savez(f"{out_name}.npz", **numpy_dict)
 
         bs = len(PROMPTS)
         for lid in (layer_id_normal, layer_id_dense):
-            for pos in (pos_id_context, pos_id_gen):
-                pref = f"Bs{bs}Lid{lid}Pos{pos}"
-                print(f"Saving dict to file: {out_name}{pref}.npz for rank {rank}")
-                # re-write individual expert arrays to large batched array
-                pref_exp = f"{pref}FfnExp"
-                re_exp = re.compile(r"^" + re.escape(pref_exp) + r"[0-9]+([a-zA-Z]+[0-9]?[a-zA-Z]+)$")
-                exp_keys_re = ((re_exp.fullmatch(k), k) for k in output_state_dict)
-                exp_keys_m = (x for x in exp_keys_re if x[0] is not None)
-                exp_keys = {m.group(1): k for m, k in exp_keys_m}
+            pref = f"Lid{lid}"
+            pref_exp = f"{pref}FfnExp"
+            re_exp = re.compile(r"^" + re.escape(pref_exp) + r"[0-9]+([a-zA-Z]+[0-9]?[a-zA-Z]+)$")
+            exp_keys_re = ((re_exp.fullmatch(k), k) for k in output_state_dict)
+            exp_keys_m = (x for x in exp_keys_re if x[0] is not None)
+            exp_keys = {m.group(1): k for m, k in exp_keys_m}
 
-                for key_no_pref, key in exp_keys.items():
-                    if "act" in key_no_pref.lower():
-                        # we could zero-out activations, but it would cost
-                        # too much memory, so we keep activations per-expert
+            for key_no_pref, key in exp_keys.items():
+                # note: this doesn't apply to activations here, and it would cost
+                # a lot of memory to store many 0s, so we keep activations per-expert
+                ref_val = output_state_dict[key]
+                new_shape = (args.n_routed_experts,) + ref_val.shape
+                new_val = torch.zeros(*new_shape, dtype=ref_val.dtype, device=ref_val.device)
+                for e in range(args.n_routed_experts):
+                    key_exp = f"{pref_exp}{e}{key_no_pref}"
+                    if key_exp not in output_state_dict:
                         continue
-                    ref_val = output_state_dict[key]
-                    new_shape = (args.n_routed_experts,) + ref_val.shape
-                    new_val = torch.zeros(*new_shape, dtype=ref_val.dtype, device=ref_val.device)
-                    for e in range(args.n_routed_experts):
-                        key_exp = f"{pref_exp}{e}{key_no_pref}"
-                        if key_exp not in output_state_dict:
-                            continue
-                        new_val[e].copy_(output_state_dict[key_exp])
-                        del output_state_dict[key_exp]
-                    output_state_dict[f"{pref_exp}{key_no_pref}"] = new_val
+                    new_val[e].copy_(output_state_dict[key_exp])
+                    del output_state_dict[key_exp]
+                output_state_dict[f"{pref_exp}{key_no_pref}"] = new_val
 
+            print()
+            out_name_lid = f"{out_name}{pref}"
+            if os.path.isfile(f"{out_name_lid}.npz"):
+                print(f"Skipping saving non-batch dependent values to {out_name_lid}.npz !")
+                # list() allows deleting keys on the fly
+                for key in list(output_state_dict):
+                    if key.startswith(pref):
+                        del output_state_dict[key]
+            else:
+                print(f"Saving non-batch dependent values to {out_name_lid}.npz")
                 numpy_dict = dict()
-                torch.set_printoptions(precision=6, threshold=8, edgeitems=2, linewidth=120, sci_mode=False)
                 # list() allows deleting keys on the fly
                 for key in list(output_state_dict):
                     if not key.startswith(pref):
                         continue
-                    key_no_pref = key[len(pref):]
-                    v = output_state_dict[key]
-                    if v is None:
-                        print(f"{key_no_pref}: skipping optional value")
-                        continue
-                    if v.dtype.is_floating_point:
-                        out_dtype = torch.float32
-                    else:
-                        out_dtype = v.dtype
-                    v_cpu = v.to(device="cpu", dtype=out_dtype)
-                    print(f"{key_no_pref}: type {v.dtype}, shape {v_cpu.shape}")
-                    numpy_dict[key_no_pref] = v_cpu.numpy()
+                    store(numpy_dict, key, key_no_pref=key[len(pref):])
                     del output_state_dict[key]
+                numpy.savez(f"{out_name_lid}.npz", **numpy_dict)
 
-                numpy.savez(f"{out_name}{pref}.npz", **numpy_dict)
+            for pos in (pos_id_context, pos_id_gen):
+                print()
+                pref_act = f"Bs{bs}Pos{pos}{pref}"
+                out_name_act = f"{out_name}{pref_act}"
+                if os.path.isfile(f"{out_name_act}.npz"):
+                    print(f"Skipping saving activation values to {out_name_act}.npz !")
+                    # list() allows deleting keys on the fly
+                    for key in list(output_state_dict):
+                        if key.startswith(pref_act):
+                            del output_state_dict[key]
+                else:
+                    print(f"Saving activation dict to file: {out_name_act}.npz for rank {rank}")
+                    numpy_dict = dict()
+                    # list() allows deleting keys on the fly
+                    for key in list(output_state_dict):
+                        if not key.startswith(pref_act):
+                            continue
+                        store(numpy_dict, key, key_no_pref=key[len(pref_act):])
+                        del output_state_dict[key]
 
+                numpy.savez(f"{out_name_act}.npz", **numpy_dict)
+
+        print()
+        print("Saved all files, checking for remaining keys: ", list(output_state_dict))
+        assert len(output_state_dict) <= 0
 
     return completion_tokens
 
