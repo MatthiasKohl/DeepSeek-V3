@@ -16,7 +16,7 @@ from safetensors.torch import load_model
 
 from model import Transformer, ModelArgs, RMSNorm, MLA, MLP, Expert, Gate, MoE,\
     Linear, ColumnParallelLinear, RowParallelLinear,\
-    apply_rotary_emb, weight_dequant, block_size
+    apply_rotary_emb, weight_dequant, block_size, linear
 
 print0 = print
 def print_seq(group: dist.ProcessGroup, *args, **kwargs):
@@ -370,7 +370,33 @@ def _copy_gate(m: Gate, base_name: str, out: dict, x: torch.Tensor = None, pref_
     # Gate must be the same on all ranks
     out[base_name + "W"] = m.weight.detach()
     out[base_name + "B"] = m.bias.detach()
+    # print_seq(group, dist.get_rank(group=group), m.weight.shape, m.weight.dtype)
+    # print_seq(group, dist.get_rank(group=group), m.bias.shape, m.bias.dtype)
+    # print_seq(group, dist.get_rank(group=group), m.bias, torch.all(m.bias[0] == m.bias))
+    # print_seq(group, dist.get_rank(group=group), m.n_groups, m.topk_groups, m.topk, m.route_scale)
     if x is not None:
+        scores = linear(x, out[base_name + "W"])
+        out[pref_x + base_name + "ScoresInit"] = scores.detach()
+        scores = scores.sigmoid()
+        out[pref_x + base_name + "ScoresSigmoid"] = scores.detach()
+        scores = scores + m.bias
+        out[pref_x + base_name + "ScoresBias"] = scores.detach()
+        scores = scores.view(x.size(0), m.n_groups, -1)
+        group_scores = scores.topk(2, dim=-1)[0]
+        out[pref_x + base_name + "ScoresGroup"] = group_scores.detach()
+        group_scores = group_scores.sum(dim=-1)
+        indices = group_scores.topk(m.topk_groups, dim=-1)[1]
+        out[pref_x + base_name + "IdxGroup"] = indices.detach()
+        mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+        scores = (scores * mask.unsqueeze(-1)).flatten(1)
+        out[pref_x + base_name + "ScoresGroupMask"] = scores.detach()
+        indices = torch.topk(scores, m.topk, dim=-1)[1]
+        out[pref_x + base_name + "IdxOut"] = indices.detach()
+        weights = out[pref_x + base_name + "ScoresSigmoid"].gather(1, indices)
+        out[pref_x + base_name + "WeightsInit"] = weights.detach()
+        weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= m.route_scale
+        out[pref_x + base_name + "WeightsOut"] = weights.type_as(x).detach()
         _copy_out(m, base_name, out, x, (pref_x, False), is_gate=True, group=group)
 
 def _copy_moe(m: MoE, base_name: str, out: dict, x: torch.Tensor = None, pref_x: str = "", group: dist.ProcessGroup = None):
